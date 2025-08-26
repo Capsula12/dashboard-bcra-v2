@@ -7,6 +7,7 @@ import streamlit as st
 
 DATA_DIR = Path(__file__).parent / "data"
 
+# Estructura esperada en cada CSV
 COLS = [
     "Código de entidad",
     "Descripción entidad",
@@ -23,6 +24,7 @@ def _to_float(v: str):
     if s == "":
         return np.nan
     s = s.replace(" ", "")
+    # coma decimal vs punto
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".")
     elif "," in s and "." not in s:
@@ -43,58 +45,58 @@ def _yyyymm_to_date(yyyymm: str):
     ts = pd.Timestamp(year=y, month=mth, day=1)
     return ts, f"{y:04d}-{mth:02d}"
 
-def _read_csv_robusto(path: Path) -> pd.DataFrame:
+def _read_csv_flexible(path: Path) -> pd.DataFrame:
     tries = [
-        {"sep":";","enc":"utf-8-sig"},
-        {"sep":";","enc":"latin-1"},
-        {"sep":",","enc":"utf-8-sig"},
-        {"sep":",","enc":"latin-1"},
-        {"sep":"\t","enc":"utf-8-sig"},
-        {"sep":"\t","enc":"latin-1"},
+        {"sep": ";", "enc": "utf-8-sig"},
+        {"sep": ";", "enc": "latin-1"},
+        {"sep": ",", "enc": "utf-8-sig"},
+        {"sep": ",", "enc": "latin-1"},
+        {"sep": "\t", "enc": "utf-8-sig"},
+        {"sep": "\t", "enc": "latin-1"},
     ]
-    last = None
+    last_err = None
     for t in tries:
         try:
-            df = pd.read_csv(path, sep=t["sep"], encoding=t["enc"], dtype=str)
+            df = pd.read_csv(path, sep=t["sep"], encoding=t["enc"], dtype=str, engine="python")
             return df
         except Exception as e:
-            last = e
+            last_err = e
             continue
-    raise RuntimeError(f"No pude leer {path.name}: {last}")
+    raise RuntimeError(f"No pude leer {path.name}: {last_err}")
 
 @st.cache_data(show_spinner=True, ttl=600)
 def load_df() -> pd.DataFrame:
-    """Lee TODOS los .csv en ./data/, valida columnas, concatena, normaliza y devuelve el DataFrame único."""
+    """
+    Lee TODOS los .csv en ./data que contengan las columnas requeridas.
+    Une, normaliza y devuelve un único DataFrame listo para usar.
+    """
     if not DATA_DIR.exists():
-        return pd.DataFrame(columns=COLS + ["Fecha_dt","Mes","Valor_num","Entidad"])
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     frames = []
-    for path in sorted(DATA_DIR.glob("*.csv")):
-        # ignorar archivos 'ocultos' o vacíos
-        if path.name.startswith("~$"):
-            continue
+    loaded_files = []
+    for p in sorted(DATA_DIR.glob("*.csv")):
         try:
-            df = _read_csv_robusto(path)
+            df = _read_csv_flexible(p)
             missing = [c for c in COLS if c not in df.columns]
             if missing:
-                # si no tiene las columnas esperadas, lo saltamos silenciosamente
+                # saltar archivos que no son de esta estructura
                 continue
             df = df[COLS].copy()
+            df["__archivo__"] = p.name  # solo informativo (no se usa para filtrar)
             frames.append(df)
+            loaded_files.append(p.name)
         except Exception:
-            # si algún archivo falla, seguimos con los demás
             continue
 
     if not frames:
-        return pd.DataFrame(columns=COLS + ["Fecha_dt","Mes","Valor_num","Entidad"])
+        return pd.DataFrame(columns=COLS + ["Fecha_dt", "Mes", "Valor_num", "Entidad", "Var_code", "Var_desc", "Var_label"])
 
     big = pd.concat(frames, ignore_index=True)
 
     # Normalizaciones
     big["Código de entidad"] = big["Código de entidad"].astype(str).str.strip().str.zfill(5)
     big["Descripción entidad"] = big["Descripción entidad"].astype(str).str.strip()
-    big["Código del dato"] = big["Código del dato"].astype(str).str.strip()
-    big["Descripción del dato"] = big["Descripción del dato"].astype(str).str.strip()
 
     dt, lab = zip(*big["Fecha del dato"].astype(str).map(_yyyymm_to_date))
     big["Fecha_dt"] = list(dt)
@@ -104,30 +106,60 @@ def load_df() -> pd.DataFrame:
     big["Valor_num"] = big["Valor"].map(_to_float)
     big["Entidad"] = big["Código de entidad"] + " - " + big["Descripción entidad"].fillna("")
 
-    # Quitar duplicados exactos por seguridad
-    big = big.drop_duplicates()
+    # Variables (código + descripción para mostrar en UI)
+    big["Var_code"] = big["Código del dato"].astype(str).str.strip()
+    big["Var_desc"] = big["Descripción del dato"].astype(str).str.strip()
+    # etiqueta amigable; si no hay desc, queda solo el código
+    big["Var_label"] = np.where(
+        big["Var_desc"].eq("") | big["Var_desc"].isna(),
+        big["Var_code"],
+        big["Var_code"] + " – " + big["Var_desc"]
+    )
 
-    # Orden canónico
-    big = big.sort_values(["Fecha_dt","Código de entidad","Código del dato"]).reset_index(drop=True)
+    big = big.sort_values(["Fecha_dt", "Código de entidad", "Var_code"]).reset_index(drop=True)
+
+    # Info al usuario
+    st.caption(
+        f"Archivos cargados desde ./data: {len(loaded_files)} "
+        + ("(" + ", ".join(loaded_files) + ")" if loaded_files else "")
+    )
 
     return big
 
 def get_defaults(df: pd.DataFrame):
-    """Defaults: entidad con 'nación' si existe, y variable código R1 si existe."""
+    """Entidad: la que contenga 'nación' si existe; Variable: la que tenga código R1 si existe (por etiqueta)."""
     ent_default = None
     if not df.empty:
         ents = df["Entidad"].unique().tolist()
         cand = [e for e in ents if "nacion" in e.lower() or "nación" in e.lower()]
         ent_default = cand[0] if cand else (ents[0] if ents else None)
 
-    var_default = None
+    var_default_label = None
     if not df.empty:
-        vars_ = df["Código del dato"].unique().tolist()
-        var_default = "R1" if "R1" in vars_ else (vars_[0] if vars_ else None)
+        # buscar etiqueta que empiece con "R1 "
+        labs = df["Var_label"].unique().tolist()
+        cand = [l for l in labs if l.startswith("R1 ")] or [l for l in labs if l.startswith("R1")]
+        var_default_label = cand[0] if cand else (labs[0] if labs else None)
 
-    return ent_default, var_default
+    return ent_default, var_default_label
 
 def month_options(df: pd.DataFrame):
     months = df.dropna(subset=["Mes"])["Mes"].unique().tolist()
     months = sorted(months)
     return months
+
+def variable_catalog(df: pd.DataFrame) -> pd.DataFrame:
+    """Catálogo único de variables con código, descripción y etiqueta."""
+    cat = df[["Var_code", "Var_desc", "Var_label"]].drop_duplicates().sort_values("Var_label")
+    return cat
+
+def label_to_code(df: pd.DataFrame, label: str) -> str:
+    """Convierte etiqueta 'COD – Desc' a código 'COD' (si no encuentra, devuelve label)."""
+    cat = variable_catalog(df)
+    row = cat.loc[cat["Var_label"] == label]
+    if not row.empty:
+        return row.iloc[0]["Var_code"]
+    # fallback: intentar cortar por ' – '
+    if " – " in label:
+        return label.split(" – ", 1)[0]
+    return label
