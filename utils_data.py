@@ -1,14 +1,15 @@
 # utils_data.py
 from pathlib import Path
 import re
+import unicodedata
 import pandas as pd
 import numpy as np
 import streamlit as st
 
 DATA_DIR = Path(__file__).parent / "data"
 
-# Estructura esperada en cada CSV
-COLS = [
+# Estructura estándar del dashboard
+COLS_STD = [
     "Código de entidad",
     "Descripción entidad",
     "Fecha del dato",
@@ -17,6 +18,7 @@ COLS = [
     "Valor",
 ]
 
+# ---------- utilidades num/fecha ----------
 def _to_float(v: str):
     if v is None:
         return np.nan
@@ -24,7 +26,6 @@ def _to_float(v: str):
     if s == "":
         return np.nan
     s = s.replace(" ", "")
-    # coma decimal vs punto
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".")
     elif "," in s and "." not in s:
@@ -45,6 +46,75 @@ def _yyyymm_to_date(yyyymm: str):
     ts = pd.Timestamp(year=y, month=mth, day=1)
     return ts, f"{y:04d}-{mth:02d}"
 
+# ---------- normalizador de encabezados ----------
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+def _norm_header(s: str) -> str:
+    s = _strip_accents(str(s)).lower().strip()
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+# mapa de sinónimos normalizados -> nombre estándar
+HEADER_MAP = {
+    # Código de la entidad
+    "codigo de entidad": "Código de entidad",
+    "codigo entidad": "Código de entidad",
+    "codigo de la entidad": "Código de entidad",
+    "cod entidad": "Código de entidad",
+    "n codent": "Código de entidad",
+    "codent": "Código de entidad",
+
+    # Descripción / nombre de la entidad
+    "descripcion entidad": "Descripción entidad",
+    "nombre de la entidad": "Descripción entidad",
+    "nombre entidad": "Descripción entidad",
+    "noment": "Descripción entidad",
+
+    # Fecha (AAAAMM)
+    "fecha del dato": "Fecha del dato",
+    "fecha": "Fecha del dato",
+    "c fecinf": "Fecha del dato",
+    "fecinf": "Fecha del dato",
+    "periodo": "Fecha del dato",
+    "periodo aaamm": "Fecha del dato",
+    "aaaamm": "Fecha del dato",
+    "mes": "Fecha del dato",
+
+    # Código de variable
+    "codigo del dato": "Código del dato",
+    "codigo dato": "Código del dato",
+    "codigo partida": "Código del dato",
+    "c partida": "Código del dato",
+    "variable": "Código del dato",
+
+    # Descripción de variable
+    "descripcion del dato": "Descripción del dato",
+    "descripcion dato": "Descripción del dato",
+    "c descri2": "Descripción del dato",
+    "descripcion": "Descripción del dato",
+
+    # Valor
+    "valor": "Valor",
+    "n total": "Valor",
+    "total": "Valor",
+    "importe": "Valor",
+    "valor actual": "Valor",
+    "valor_actual": "Valor",
+}
+
+def _rename_headers(df: pd.DataFrame) -> pd.DataFrame:
+    ren = {}
+    for c in df.columns:
+        nc = _norm_header(c)
+        if nc in HEADER_MAP:
+            ren[c] = HEADER_MAP[nc]
+    if ren:
+        df = df.rename(columns=ren)
+    return df
+
+# ---------- lector flexible ----------
 def _read_csv_flexible(path: Path) -> pd.DataFrame:
     tries = [
         {"sep": ";", "enc": "utf-8-sig"},
@@ -64,33 +134,63 @@ def _read_csv_flexible(path: Path) -> pd.DataFrame:
             continue
     raise RuntimeError(f"No pude leer {path.name}: {last_err}")
 
+# ---------- catálogo de variables ----------
+def _build_var_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Var_label = SOLO descripción.
+    Si una misma descripción corresponde a >1 código distinto,
+    se numeran: 'Descripción', 'Descripción (2)', 'Descripción (3)', ...
+    """
+    pairs = df[["Var_desc", "Var_code"]].drop_duplicates()
+    # cuántos códigos únicos por descripción
+    counts = pairs.groupby("Var_desc")["Var_code"].nunique()
+    dup_desc = set(counts[counts > 1].index)
+
+    label_map = {}
+    for desc, sub in pairs.groupby("Var_desc"):
+        sub = sub.sort_values("Var_code")  # estable
+        if desc in dup_desc:
+            for i, (_, row) in enumerate(sub.iterrows(), start=1):
+                label_map[(desc, row["Var_code"])] = f"{desc or '—'} ({i})"
+        else:
+            # único
+            for _, row in sub.iterrows():
+                label_map[(desc, row["Var_code"])] = desc or "—"
+
+    df["Var_label"] = [label_map.get((d, c), d or "—") for d, c in zip(df["Var_desc"], df["Var_code"])]
+    return df
+
+# ---------- API pública ----------
 @st.cache_data(show_spinner=True, ttl=600)
 def load_df() -> pd.DataFrame:
     """
-    Lee TODOS los .csv en ./data que contengan las columnas requeridas.
-    Une, normaliza y devuelve un único DataFrame listo para usar.
+    Lee TODOS los .csv en ./data, intenta mapear encabezados "parecidos"
+    a los nombres estándar y concatena sólo los que quedan completos.
     """
     if not DATA_DIR.exists():
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     frames = []
-    loaded_files = []
+    loaded, skipped = [], []
+
     for p in sorted(DATA_DIR.glob("*.csv")):
         try:
-            df = _read_csv_flexible(p)
-            missing = [c for c in COLS if c not in df.columns]
+            raw = _read_csv_flexible(p)
+            raw = _rename_headers(raw)
+            missing = [c for c in COLS_STD if c not in raw.columns]
             if missing:
-                # saltar archivos que no son de esta estructura
+                skipped.append(f"{p.name} (faltan: {', '.join(missing)})")
                 continue
-            df = df[COLS].copy()
-            df["__archivo__"] = p.name  # solo informativo (no se usa para filtrar)
+            df = raw[COLS_STD].copy()
+            df["__archivo__"] = p.name
             frames.append(df)
-            loaded_files.append(p.name)
-        except Exception:
-            continue
+            loaded.append(p.name)
+        except Exception as e:
+            skipped.append(f"{p.name} (error: {e})")
 
     if not frames:
-        return pd.DataFrame(columns=COLS + ["Fecha_dt", "Mes", "Valor_num", "Entidad", "Var_code", "Var_desc", "Var_label"])
+        st.caption("No se cargaron CSV válidos desde ./data")
+        return pd.DataFrame(columns=COLS_STD + ["Fecha_dt","Mes","Valor_num","Entidad","Var_code","Var_desc","Var_label"])
 
     big = pd.concat(frames, ignore_index=True)
 
@@ -106,28 +206,31 @@ def load_df() -> pd.DataFrame:
     big["Valor_num"] = big["Valor"].map(_to_float)
     big["Entidad"] = big["Código de entidad"] + " - " + big["Descripción entidad"].fillna("")
 
-    # Variables (código + descripción para mostrar en UI)
+    # Variables
     big["Var_code"] = big["Código del dato"].astype(str).str.strip()
     big["Var_desc"] = big["Descripción del dato"].astype(str).str.strip()
-    # etiqueta amigable; si no hay desc, queda solo el código
-    big["Var_label"] = np.where(
-        big["Var_desc"].eq("") | big["Var_desc"].isna(),
-        big["Var_code"],
-        big["Var_code"] + " – " + big["Var_desc"]
-    )
 
-    big = big.sort_values(["Fecha_dt", "Código de entidad", "Var_code"]).reset_index(drop=True)
+    # Etiquetas SOLO con descripción (con sufijos si hay duplicados)
+    big = _build_var_labels(big)
+
+    big = big.sort_values(["Fecha_dt", "Código de entidad", "Var_desc", "Var_code"]).reset_index(drop=True)
 
     # Info al usuario
-    st.caption(
-        f"Archivos cargados desde ./data: {len(loaded_files)} "
-        + ("(" + ", ".join(loaded_files) + ")" if loaded_files else "")
-    )
+    msg = f"Archivos cargados desde ./data: {len(loaded)}"
+    if loaded:
+        msg += " (" + ", ".join(loaded) + ")"
+    if skipped:
+        msg += f" · Ignorados: {len(skipped)}"
+    st.caption(msg)
+    if skipped:
+        with st.expander("Ver archivos ignorados"):
+            for s in skipped:
+                st.markdown(f"- {s}")
 
     return big
 
 def get_defaults(df: pd.DataFrame):
-    """Entidad: la que contenga 'nación' si existe; Variable: la que tenga código R1 si existe (por etiqueta)."""
+    """Entidad: la que contenga 'nación' si existe; Variable: la primera etiqueta (por descripción)."""
     ent_default = None
     if not df.empty:
         ents = df["Entidad"].unique().tolist()
@@ -136,10 +239,8 @@ def get_defaults(df: pd.DataFrame):
 
     var_default_label = None
     if not df.empty:
-        # buscar etiqueta que empiece con "R1 "
         labs = df["Var_label"].unique().tolist()
-        cand = [l for l in labs if l.startswith("R1 ")] or [l for l in labs if l.startswith("R1")]
-        var_default_label = cand[0] if cand else (labs[0] if labs else None)
+        var_default_label = labs[0] if labs else None
 
     return ent_default, var_default_label
 
@@ -149,17 +250,14 @@ def month_options(df: pd.DataFrame):
     return months
 
 def variable_catalog(df: pd.DataFrame) -> pd.DataFrame:
-    """Catálogo único de variables con código, descripción y etiqueta."""
-    cat = df[["Var_code", "Var_desc", "Var_label"]].drop_duplicates().sort_values("Var_label")
-    return cat
+    """Catálogo único: etiqueta (sólo descripción) y su código asociado."""
+    return df[["Var_label","Var_code"]].drop_duplicates().sort_values("Var_label")
 
 def label_to_code(df: pd.DataFrame, label: str) -> str:
-    """Convierte etiqueta 'COD – Desc' a código 'COD' (si no encuentra, devuelve label)."""
+    """Convierte etiqueta (descripción o descripción con sufijo) a código."""
     cat = variable_catalog(df)
     row = cat.loc[cat["Var_label"] == label]
     if not row.empty:
         return row.iloc[0]["Var_code"]
-    # fallback: intentar cortar por ' – '
-    if " – " in label:
-        return label.split(" – ", 1)[0]
+    # fallback: si no encuentra, devuelve el mismo label
     return label
