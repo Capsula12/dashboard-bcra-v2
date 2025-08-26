@@ -1,8 +1,7 @@
 # pages/1_Series.py
 import streamlit as st
 import altair as alt
-import pandas as pd
-from utils_data import load_df, get_defaults, month_options
+from utils_data import load_df, get_defaults, month_options, variable_catalog, label_to_code
 
 st.set_page_config(page_title="Series", page_icon="📈", layout="wide")
 st.title("📈 Series por variable")
@@ -12,38 +11,32 @@ if df.empty:
     st.error("No hay datos.")
     st.stop()
 
-# Sidebar
 st.sidebar.header("Filtros")
-origenes = st.sidebar.multiselect("Origen", sorted(df["Origen"].unique()), default=sorted(df["Origen"].unique()))
-df = df[df["Origen"].isin(origenes)]
+ent_default, var_default_label = get_defaults(df)
 
-ent_default, var_default = get_defaults(df)
+entidades = sorted(df["Entidad"].unique())
+ent_sel = st.sidebar.selectbox("Entidad", options=entidades, index=(entidades.index(ent_default) if ent_default in entidades else 0))
 
-entidades = st.sidebar.multiselect("Entidades", sorted(df["Entidad"].unique()), default=[ent_default] if ent_default else [])
-variables = sorted(df["Código del dato"].unique())
-var_sel = st.sidebar.selectbox("Variable", options=variables, index=(variables.index(var_default) if var_default in variables else 0))
+cat = variable_catalog(df)
+var_label = st.sidebar.selectbox("Variable (código – descripción)", options=cat["Var_label"].tolist(),
+                                 index=(cat["Var_label"].tolist().index(var_default_label) if var_default_label in cat["Var_label"].tolist() else 0))
+var_code = label_to_code(df, var_label)
 
 months = month_options(df)
-if not months:
-    st.error("No hay meses válidos (columna 'Fecha del dato').")
-    st.stop()
-
 rango = st.sidebar.select_slider("Rango de meses", options=months, value=(months[0], months[-1]))
 m_min, m_max = rango
 
-# Filtro principal
 mask = (
-    df["Entidad"].isin(entidades) &
-    (df["Código del dato"] == var_sel) &
+    (df["Entidad"] == ent_sel) &
+    (df["Var_code"] == var_code) &
     (df["Mes"] >= m_min) & (df["Mes"] <= m_max)
 )
-dfv = df.loc[mask, ["Fecha_dt", "Mes", "Entidad", "Código del dato", "Descripción del dato", "Valor_num", "Origen"]].copy()
+dfv = df.loc[mask, ["Fecha_dt", "Mes", "Entidad", "Var_label", "Valor_num"]].copy()
 
 if dfv.empty:
     st.warning("No hay datos para ese filtro.")
     st.stop()
 
-# Chart
 chart = (
     alt.Chart(dfv, height=420)
     .mark_line(point=True)
@@ -54,13 +47,11 @@ chart = (
         tooltip=[
             alt.Tooltip("Mes:N"),
             alt.Tooltip("Entidad:N"),
-            alt.Tooltip("Descripción del dato:N", title="Variable"),
+            alt.Tooltip("Var_label:N", title="Variable"),
             alt.Tooltip("Valor_num:Q", title="Valor", format=",.2f"),
-            alt.Tooltip("Origen:N"),
         ],
     )
 )
-
 st.altair_chart(chart, use_container_width=True)
 
 st.caption("Tabla de datos")
